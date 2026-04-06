@@ -8,32 +8,39 @@ defmodule PocketidScimSync.Worker do
     GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
   end
 
-  def init(state) do
+  def init(_opts) do
+    config = %{
+      pocket_id_url: Application.fetch_env!(:pocketid_scim_sync, :pocket_id_url),
+      pocket_id_admin_key: Application.fetch_env!(:pocketid_scim_sync, :pocket_id_admin_key),
+      aws_scim_endpoint: Application.fetch_env!(:pocketid_scim_sync, :aws_scim_endpoint),
+      aws_scim_token: Application.fetch_env!(:pocketid_scim_sync, :aws_scim_token)
+    }
+
     schedule_sync(1000)
-    {:ok, state}
+    {:ok, config}
   end
 
-  def handle_info(:sync, state) do
-    perform_sync()
+  def handle_info(:sync, config) do
+    perform_sync(config)
     schedule_sync(@sync_interval)
-    {:noreply, state}
+    {:noreply, config}
   end
 
-  defp perform_sync do
+  defp perform_sync(config) do
     Logger.info("Starting SCIM reconciliation loop...")
 
-    with {:ok, pocket_users} <- fetch_pocket_id_users(),
-         {:ok, aws_users} <- fetch_aws_users() do
+    with {:ok, pocket_users} <- fetch_pocket_id_users(config),
+         {:ok, aws_users} <- fetch_aws_users(config) do
       # 1. Create a Set of PocketID emails for O(1) lookup
       pocket_emails = MapSet.new(pocket_users, fn u -> u["email"] end)
 
       # 2. Upsert (Create/Update) all users currently in PocketID
-      Enum.each(pocket_users, &upsert_to_aws/1)
+      Enum.each(pocket_users, &upsert_to_aws(&1, config))
 
       # 3. Find and Delete users in AWS that are NOT in PocketID
       aws_users
       |> Enum.filter(fn aws_user -> !MapSet.member?(pocket_emails, aws_user["userName"]) end)
-      |> Enum.each(&delete_from_aws/1)
+      |> Enum.each(&delete_from_aws(&1, config))
 
       Logger.info("Reconciliation complete.")
     end
@@ -41,9 +48,9 @@ defmodule PocketidScimSync.Worker do
 
   # --- API Fetchers ---
 
-  defp fetch_pocket_id_users do
-    url = "#{System.get_env("POCKET_ID_URL")}/api/users"
-    headers = ["X-API-KEY": System.get_env("POCKETID_ADMIN_KEY")]
+  defp fetch_pocket_id_users(config) do
+    url = "#{config.pocket_id_url}/api/users"
+    headers = ["X-API-KEY": config.pocket_id_admin_key]
 
     case Req.get(url, headers: headers) do
       {:ok, %{status: 200, body: %{"data" => users}}} ->
@@ -59,12 +66,11 @@ defmodule PocketidScimSync.Worker do
     end
   end
 
-  defp fetch_aws_users do
-    url = System.get_env("AWS_SCIM_ENDPOINT") <> "/Users"
-    token = System.get_env("AWS_SCIM_TOKEN")
+  defp fetch_aws_users(config) do
+    url = config.aws_scim_endpoint <> "/Users"
 
     # Note: AWS SCIM usually paginates. For small homelabs, the default (50) is usually enough.
-    case Req.get(url, auth: {:bearer, token}) do
+    case Req.get(url, auth: {:bearer, config.aws_scim_token}) do
       {:ok, %{status: 200, body: %{"Resources" => users}}} ->
         {:ok, users}
 
@@ -80,11 +86,10 @@ defmodule PocketidScimSync.Worker do
 
   # --- AWS Actions ---
 
-  defp upsert_to_aws(user) do
+  defp upsert_to_aws(user, config) do
     email = user["email"]
     display_name = "#{user["firstName"]} #{user["lastName"]}"
-    scim_url = System.get_env("AWS_SCIM_ENDPOINT") <> "/Users"
-    token = System.get_env("AWS_SCIM_TOKEN")
+    scim_url = config.aws_scim_endpoint <> "/Users"
 
     body = %{
       schemas: ["urn:ietf:params:scim:schemas:core:2.0:User"],
@@ -99,23 +104,22 @@ defmodule PocketidScimSync.Worker do
       active: true
     }
 
-    case Req.post(scim_url, json: body, auth: {:bearer, token}) do
+    case Req.post(scim_url, json: body, auth: {:bearer, config.aws_scim_token}) do
       {:ok, %{status: 201}} -> Logger.info("Created user: #{email}")
       {:ok, %{status: 409}} -> Logger.debug("User exists: #{email}")
       error -> Logger.error("Failed upsert for #{email}: #{inspect(error)}")
     end
   end
 
-  defp delete_from_aws(aws_user) do
+  defp delete_from_aws(aws_user, config) do
     # SCIM Delete requires the AWS Internal ID, not the username
     id = aws_user["id"]
     email = aws_user["userName"]
-    url = System.get_env("AWS_SCIM_ENDPOINT") <> "/Users/#{id}"
-    token = System.get_env("AWS_SCIM_TOKEN")
+    url = config.aws_scim_endpoint <> "/Users/#{id}"
 
-    Logger.warn("Deleting stale user from AWS: #{email}")
+    Logger.warning("Deleting stale user from AWS: #{email}")
 
-    case Req.delete(url, auth: {:bearer, token}) do
+    case Req.delete(url, auth: {:bearer, config.aws_scim_token}) do
       {:ok, %{status: 204}} -> Logger.info("Successfully deleted #{email}")
       error -> Logger.error("Failed to delete #{email}: #{inspect(error)}")
     end
