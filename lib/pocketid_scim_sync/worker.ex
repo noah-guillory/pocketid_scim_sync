@@ -28,7 +28,7 @@ defmodule PocketidScimSync.Worker do
   end
 
   defp fetch_pocket_id_users do
-    url = "https://id.noahguillory.net/api/users"
+    url = "#{System.get_env("POCKET_ID_URL")}/api/users"
     headers = ["X-API-KEY": "#{System.get_env("POCKETID_ADMIN_KEY")}"]
 
     case Req.get(url, headers: headers) do
